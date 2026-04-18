@@ -1,6 +1,8 @@
-import { AfterViewInit, Component, ElementRef, OnDestroy, ViewChild } from '@angular/core';
 import { CommonModule } from '@angular/common';
+import { AfterViewInit, Component, ElementRef, OnDestroy, ViewChild } from '@angular/core';
 import Konva from 'konva';
+
+type ToolMode = 'pan' | 'rect' | 'polygon';
 
 @Component({
   selector: 'app-root',
@@ -20,12 +22,13 @@ export class AppComponent implements AfterViewInit, OnDestroy {
   ];
 
   currentIndex = 0;
-  mode: 'rect' | 'polygon' = 'rect';
+  mode: ToolMode = 'pan';
 
   private stage!: Konva.Stage;
-  private imageLayer!: Konva.Layer;
-  private drawLayer!: Konva.Layer;
+  private layer!: Konva.Layer;
+  private contentGroup!: Konva.Group;
   private imageNode?: Konva.Image;
+
   private drawingRect?: Konva.Rect;
   private polygonPoints: number[] = [];
   private polygonPreview?: Konva.Line;
@@ -38,13 +41,14 @@ export class AppComponent implements AfterViewInit, OnDestroy {
       draggable: true
     });
 
-    this.imageLayer = new Konva.Layer();
-    this.drawLayer = new Konva.Layer();
-    this.stage.add(this.imageLayer);
-    this.stage.add(this.drawLayer);
+    this.layer = new Konva.Layer();
+    this.contentGroup = new Konva.Group({ x: 0, y: 0 });
+    this.layer.add(this.contentGroup);
+    this.stage.add(this.layer);
 
     this.registerEvents();
     this.loadImage(0);
+    this.updateStageDragState();
   }
 
   ngOnDestroy(): void {
@@ -53,13 +57,14 @@ export class AppComponent implements AfterViewInit, OnDestroy {
 
   switchImage(index: number): void {
     this.currentIndex = index;
-    this.resetDrawState();
+    this.clearCurrentDrawingState();
     this.loadImage(index);
   }
 
-  setMode(mode: 'rect' | 'polygon'): void {
+  setMode(mode: ToolMode): void {
     this.mode = mode;
-    this.resetDrawState();
+    this.clearCurrentDrawingState();
+    this.updateStageDragState();
   }
 
   zoom(delta: number): void {
@@ -72,33 +77,43 @@ export class AppComponent implements AfterViewInit, OnDestroy {
   private registerEvents(): void {
     this.stage.on('wheel', (event) => {
       event.evt.preventDefault();
-      const scaleBy = 1.05;
+
       const oldScale = this.stage.scaleX();
       const pointer = this.stage.getPointerPosition();
-      if (!pointer) return;
+      if (!pointer) {
+        return;
+      }
+
+      const zoomFactor = 1.05;
+      const direction = event.evt.deltaY > 0 ? -1 : 1;
+      const nextScale = direction > 0 ? oldScale * zoomFactor : oldScale / zoomFactor;
+      const clampedScale = Math.max(0.2, Math.min(4, nextScale));
 
       const mousePointTo = {
         x: (pointer.x - this.stage.x()) / oldScale,
         y: (pointer.y - this.stage.y()) / oldScale
       };
 
-      const direction = event.evt.deltaY > 0 ? -1 : 1;
-      const newScale = direction > 0 ? oldScale * scaleBy : oldScale / scaleBy;
-      const clamped = Math.max(0.2, Math.min(4, newScale));
-      this.stage.scale({ x: clamped, y: clamped });
-
-      const newPos = {
-        x: pointer.x - mousePointTo.x * clamped,
-        y: pointer.y - mousePointTo.y * clamped
-      };
-      this.stage.position(newPos);
+      this.stage.scale({ x: clampedScale, y: clampedScale });
+      this.stage.position({
+        x: pointer.x - mousePointTo.x * clampedScale,
+        y: pointer.y - mousePointTo.y * clampedScale
+      });
       this.stage.batchDraw();
     });
 
-    this.stage.on('mousedown', () => {
-      if (this.mode !== 'rect' || !this.imageNode) return;
-      const pointer = this.stage.getPointerPosition();
-      if (!pointer) return;
+    this.stage.on('mousedown', (event) => {
+      if (this.mode !== 'rect' || !this.imageNode) {
+        return;
+      }
+      if (event.target !== this.imageNode) {
+        return;
+      }
+
+      const pointer = this.getPointerInContent();
+      if (!pointer) {
+        return;
+      }
 
       this.drawingRect = new Konva.Rect({
         x: pointer.x,
@@ -108,39 +123,53 @@ export class AppComponent implements AfterViewInit, OnDestroy {
         stroke: '#ff4d4f',
         strokeWidth: 2
       });
-      this.drawLayer.add(this.drawingRect);
+      this.contentGroup.add(this.drawingRect);
+      this.layer.batchDraw();
     });
 
     this.stage.on('mousemove', () => {
-      if (this.mode !== 'rect' || !this.drawingRect) {
-        if (this.mode === 'polygon' && this.polygonPreview) {
-          const pointer = this.stage.getPointerPosition();
-          if (!pointer) return;
-          const points = [...this.polygonPoints, pointer.x, pointer.y];
-          this.polygonPreview.points(points);
-          this.drawLayer.batchDraw();
+      if (this.mode === 'polygon' && this.polygonPreview) {
+        const pointer = this.getPointerInContent();
+        if (!pointer) {
+          return;
         }
+        this.polygonPreview.points([...this.polygonPoints, pointer.x, pointer.y]);
+        this.layer.batchDraw();
         return;
       }
 
-      const pointer = this.stage.getPointerPosition();
-      if (!pointer) return;
+      if (this.mode !== 'rect' || !this.drawingRect) {
+        return;
+      }
 
-      const x = this.drawingRect.x();
-      const y = this.drawingRect.y();
-      this.drawingRect.width(pointer.x - x);
-      this.drawingRect.height(pointer.y - y);
-      this.drawLayer.batchDraw();
+      const pointer = this.getPointerInContent();
+      if (!pointer) {
+        return;
+      }
+
+      this.drawingRect.width(pointer.x - this.drawingRect.x());
+      this.drawingRect.height(pointer.y - this.drawingRect.y());
+      this.layer.batchDraw();
     });
 
     this.stage.on('mouseup', () => {
-      this.drawingRect = undefined;
+      if (this.mode === 'rect') {
+        this.drawingRect = undefined;
+      }
     });
 
-    this.stage.on('click', () => {
-      if (this.mode !== 'polygon') return;
-      const pointer = this.stage.getPointerPosition();
-      if (!pointer) return;
+    this.stage.on('click', (event) => {
+      if (this.mode !== 'polygon' || !this.imageNode) {
+        return;
+      }
+      if (event.target !== this.imageNode && event.target !== this.polygonPreview) {
+        return;
+      }
+
+      const pointer = this.getPointerInContent();
+      if (!pointer) {
+        return;
+      }
 
       this.polygonPoints.push(pointer.x, pointer.y);
       if (!this.polygonPreview) {
@@ -150,16 +179,19 @@ export class AppComponent implements AfterViewInit, OnDestroy {
           strokeWidth: 2,
           closed: false
         });
-        this.drawLayer.add(this.polygonPreview);
+        this.contentGroup.add(this.polygonPreview);
       } else {
         this.polygonPreview.points([...this.polygonPoints]);
       }
-      this.drawLayer.batchDraw();
+      this.layer.batchDraw();
     });
 
     this.stage.on('dblclick', () => {
-      if (this.mode !== 'polygon' || this.polygonPoints.length < 6) return;
-      this.polygonPreview?.destroy();
+      if (this.mode !== 'polygon' || this.polygonPoints.length < 6 || !this.polygonPreview) {
+        return;
+      }
+
+      this.polygonPreview.destroy();
       const polygon = new Konva.Line({
         points: [...this.polygonPoints],
         stroke: '#1e90ff',
@@ -167,10 +199,11 @@ export class AppComponent implements AfterViewInit, OnDestroy {
         strokeWidth: 2,
         closed: true
       });
-      this.drawLayer.add(polygon);
+      this.contentGroup.add(polygon);
+
       this.polygonPoints = [];
       this.polygonPreview = undefined;
-      this.drawLayer.batchDraw();
+      this.layer.batchDraw();
     });
   }
 
@@ -178,6 +211,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
     const img = new Image();
     img.crossOrigin = 'anonymous';
     img.src = this.images[index];
+
     img.onload = () => {
       this.imageNode?.destroy();
 
@@ -186,6 +220,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
         this.stage.height() / img.height
       );
 
+      this.contentGroup.destroyChildren();
       this.imageNode = new Konva.Image({
         image: img,
         x: 0,
@@ -193,21 +228,41 @@ export class AppComponent implements AfterViewInit, OnDestroy {
         width: img.width * fitScale,
         height: img.height * fitScale
       });
+      this.contentGroup.add(this.imageNode);
+
+      this.polygonPoints = [];
+      this.polygonPreview = undefined;
+      this.drawingRect = undefined;
+
       this.stage.position({ x: 0, y: 0 });
       this.stage.scale({ x: 1, y: 1 });
-
-      this.imageLayer.destroyChildren();
-      this.imageLayer.add(this.imageNode);
-      this.imageLayer.draw();
-      this.drawLayer.destroyChildren();
-      this.drawLayer.draw();
+      this.layer.draw();
     };
   }
 
-  private resetDrawState(): void {
+  private clearCurrentDrawingState(): void {
     this.polygonPoints = [];
     this.polygonPreview?.destroy();
     this.polygonPreview = undefined;
     this.drawingRect = undefined;
+  }
+
+  private updateStageDragState(): void {
+    this.stage.draggable(this.mode === 'pan');
+  }
+
+  private getPointerInContent(): Konva.Vector2d | null {
+    const pointer = this.contentGroup.getRelativePointerPosition();
+    if (!pointer || !this.imageNode) {
+      return null;
+    }
+
+    const withinImage =
+      pointer.x >= this.imageNode.x() &&
+      pointer.y >= this.imageNode.y() &&
+      pointer.x <= this.imageNode.x() + this.imageNode.width() &&
+      pointer.y <= this.imageNode.y() + this.imageNode.height();
+
+    return withinImage ? pointer : null;
   }
 }
