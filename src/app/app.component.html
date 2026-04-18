@@ -1,0 +1,28 @@
+<div class="page">
+  <aside class="left-panel">
+    <h3>图片序号</h3>
+    <button
+      *ngFor="let img of images; let idx = index"
+      (click)="switchImage(idx)"
+      [class.active]="currentIndex === idx"
+    >
+      {{ idx + 1 }}
+    </button>
+
+    <h4>鼠标模式</h4>
+    <button (click)="setMode('pan')" [class.active]="mode === 'pan'">鼠标(拖拽/缩放)</button>
+    <button (click)="setMode('rect')" [class.active]="mode === 'rect'">矩形标注</button>
+    <button (click)="setMode('polygon')" [class.active]="mode === 'polygon'">多边形标注</button>
+
+    <h4>缩放</h4>
+    <button (click)="zoom(0.1)">放大</button>
+    <button (click)="zoom(-0.1)">缩小</button>
+    <p class="tip">多边形：单击加点，双击闭合</p>
+    <p class="tip">标注模式下禁用拖拽，避免和画框冲突</p>
+    <p class="tip">标注完成后自动缓存到本地 IndexedDB</p>
+  </aside>
+
+  <main class="canvas-wrapper">
+    <div #stageHost class="stage-host"></div>
+  </main>
+</div>
