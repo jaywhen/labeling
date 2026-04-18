@@ -3,6 +3,21 @@ import { AfterViewInit, Component, ElementRef, OnDestroy, ViewChild } from '@ang
 import Konva from 'konva';
 
 type ToolMode = 'pan' | 'rect' | 'polygon';
+type AnnotationType = 'rect' | 'polygon';
+
+interface StoredAnnotation {
+  type: AnnotationType;
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+  points?: number[];
+}
+
+interface AnnotationRecord {
+  imageIndex: number;
+  annotations: StoredAnnotation[];
+}
 
 @Component({
   selector: 'app-root',
@@ -24,6 +39,11 @@ export class AppComponent implements AfterViewInit, OnDestroy {
   currentIndex = 0;
   mode: ToolMode = 'pan';
 
+  private readonly dbName = 'annotation-cache';
+  private readonly dbVersion = 1;
+  private readonly storeName = 'annotations';
+  private dbPromise?: Promise<IDBDatabase>;
+
   private stage!: Konva.Stage;
   private layer!: Konva.Layer;
   private contentGroup!: Konva.Group;
@@ -34,6 +54,8 @@ export class AppComponent implements AfterViewInit, OnDestroy {
   private polygonPreview?: Konva.Line;
 
   ngAfterViewInit(): void {
+    this.dbPromise = this.initDB();
+
     this.stage = new Konva.Stage({
       container: this.stageHost.nativeElement,
       width: this.stageHost.nativeElement.clientWidth,
@@ -153,9 +175,17 @@ export class AppComponent implements AfterViewInit, OnDestroy {
     });
 
     this.stage.on('mouseup', () => {
-      if (this.mode === 'rect') {
-        this.drawingRect = undefined;
+      if (this.mode !== 'rect' || !this.drawingRect) {
+        return;
       }
+
+      const minSize = 3;
+      if (Math.abs(this.drawingRect.width()) < minSize || Math.abs(this.drawingRect.height()) < minSize) {
+        this.drawingRect.destroy();
+      }
+      this.drawingRect = undefined;
+      this.layer.batchDraw();
+      void this.saveAnnotationsForCurrentImage();
     });
 
     this.stage.on('click', (event) => {
@@ -204,6 +234,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
       this.polygonPoints = [];
       this.polygonPreview = undefined;
       this.layer.batchDraw();
+      void this.saveAnnotationsForCurrentImage();
     });
   }
 
@@ -237,6 +268,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
       this.stage.position({ x: 0, y: 0 });
       this.stage.scale({ x: 1, y: 1 });
       this.layer.draw();
+      void this.restoreAnnotations(index);
     };
   }
 
@@ -264,5 +296,127 @@ export class AppComponent implements AfterViewInit, OnDestroy {
       pointer.y <= this.imageNode.y() + this.imageNode.height();
 
     return withinImage ? pointer : null;
+  }
+
+  private initDB(): Promise<IDBDatabase> {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(this.dbName, this.dbVersion);
+
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(this.storeName)) {
+          db.createObjectStore(this.storeName, { keyPath: 'imageIndex' });
+        }
+      };
+
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error ?? new Error('Failed to open indexedDB'));
+    });
+  }
+
+  private async saveAnnotationsForCurrentImage(): Promise<void> {
+    const db = await this.dbPromise;
+    if (!db) {
+      return;
+    }
+
+    const annotations = this.serializeAnnotations();
+    const payload: AnnotationRecord = {
+      imageIndex: this.currentIndex,
+      annotations
+    };
+
+    await this.putRecord(db, payload);
+  }
+
+  private serializeAnnotations(): StoredAnnotation[] {
+    const nodes = this.contentGroup.getChildren((node) => node !== this.imageNode);
+    const result: StoredAnnotation[] = [];
+
+    nodes.forEach((node) => {
+      if (node === this.polygonPreview || node === this.drawingRect) {
+        return;
+      }
+
+      if (node instanceof Konva.Rect) {
+        result.push({
+          type: 'rect',
+          x: node.x(),
+          y: node.y(),
+          width: node.width(),
+          height: node.height()
+        });
+      }
+
+      if (node instanceof Konva.Line && node.closed()) {
+        result.push({
+          type: 'polygon',
+          points: node.points()
+        });
+      }
+    });
+
+    return result;
+  }
+
+  private async restoreAnnotations(imageIndex: number): Promise<void> {
+    const db = await this.dbPromise;
+    if (!db) {
+      return;
+    }
+
+    const record = await this.getRecord(db, imageIndex);
+    if (!record?.annotations?.length) {
+      return;
+    }
+
+    record.annotations.forEach((item) => {
+      if (item.type === 'rect') {
+        const rect = new Konva.Rect({
+          x: item.x ?? 0,
+          y: item.y ?? 0,
+          width: item.width ?? 0,
+          height: item.height ?? 0,
+          stroke: '#ff4d4f',
+          strokeWidth: 2
+        });
+        this.contentGroup.add(rect);
+      }
+
+      if (item.type === 'polygon') {
+        const polygon = new Konva.Line({
+          points: item.points ?? [],
+          stroke: '#1e90ff',
+          fill: 'rgba(30,144,255,0.25)',
+          strokeWidth: 2,
+          closed: true
+        });
+        this.contentGroup.add(polygon);
+      }
+    });
+
+    this.layer.batchDraw();
+  }
+
+  private putRecord(db: IDBDatabase, payload: AnnotationRecord): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(this.storeName, 'readwrite');
+      const store = tx.objectStore(this.storeName);
+      store.put(payload);
+
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error ?? new Error('Failed to save annotations'));
+    });
+  }
+
+  private getRecord(db: IDBDatabase, imageIndex: number): Promise<AnnotationRecord | undefined> {
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(this.storeName, 'readonly');
+      const store = tx.objectStore(this.storeName);
+      const request = store.get(imageIndex);
+
+      request.onsuccess = () => resolve(request.result as AnnotationRecord | undefined);
+      request.onerror = () => reject(request.error ?? new Error('Failed to load annotations'));
+    });
   }
 }
