@@ -2,22 +2,9 @@ import { CommonModule } from '@angular/common';
 import { AfterViewInit, Component, ElementRef, OnDestroy, ViewChild } from '@angular/core';
 import Konva from 'konva';
 
-type ToolMode = 'pan' | 'rect' | 'polygon';
-type AnnotationType = 'rect' | 'polygon';
-
-interface StoredAnnotation {
-  type: AnnotationType;
-  x?: number;
-  y?: number;
-  width?: number;
-  height?: number;
-  points?: number[];
-}
-
-interface AnnotationRecord {
-  imageIndex: number;
-  annotations: StoredAnnotation[];
-}
+import { IMAGE_URLS, POLYGON_STYLE, RECT_STYLE } from './const';
+import { AnnotationService } from './services/annotation.service';
+import { ToolMode } from './types/annotation.types';
 
 @Component({
   selector: 'app-root',
@@ -29,20 +16,10 @@ interface AnnotationRecord {
 export class AppComponent implements AfterViewInit, OnDestroy {
   @ViewChild('stageHost', { static: true }) stageHost!: ElementRef<HTMLDivElement>;
 
-  readonly images = [
-    'https://raw.githubusercontent.com/jaywhen/data-annotation/main/src/assets/image/cat.png',
-    'https://raw.githubusercontent.com/jaywhen/data-annotation/main/src/assets/image/cat1.jpeg',
-    'https://raw.githubusercontent.com/jaywhen/data-annotation/main/src/assets/image/cat2.jpg',
-    'https://raw.githubusercontent.com/jaywhen/data-annotation/main/src/assets/image/cat3.jpg'
-  ];
+  readonly images = IMAGE_URLS;
 
   currentIndex = 0;
   mode: ToolMode = 'pan';
-
-  private readonly dbName = 'annotation-cache';
-  private readonly dbVersion = 1;
-  private readonly storeName = 'annotations';
-  private dbPromise?: Promise<IDBDatabase>;
 
   private stage!: Konva.Stage;
   private layer!: Konva.Layer;
@@ -53,9 +30,9 @@ export class AppComponent implements AfterViewInit, OnDestroy {
   private polygonPoints: number[] = [];
   private polygonPreview?: Konva.Line;
 
-  ngAfterViewInit(): void {
-    this.dbPromise = this.initDB();
+  constructor(private readonly annotationService: AnnotationService) {}
 
+  ngAfterViewInit(): void {
     this.stage = new Konva.Stage({
       container: this.stageHost.nativeElement,
       width: this.stageHost.nativeElement.clientWidth,
@@ -142,8 +119,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
         y: pointer.y,
         width: 0,
         height: 0,
-        stroke: '#ff4d4f',
-        strokeWidth: 2
+        ...RECT_STYLE
       });
       this.contentGroup.add(this.drawingRect);
       this.layer.batchDraw();
@@ -205,9 +181,9 @@ export class AppComponent implements AfterViewInit, OnDestroy {
       if (!this.polygonPreview) {
         this.polygonPreview = new Konva.Line({
           points: [...this.polygonPoints],
-          stroke: '#1e90ff',
-          strokeWidth: 2,
-          closed: false
+          closed: false,
+          stroke: POLYGON_STYLE.stroke,
+          strokeWidth: POLYGON_STYLE.strokeWidth
         });
         this.contentGroup.add(this.polygonPreview);
       } else {
@@ -224,10 +200,8 @@ export class AppComponent implements AfterViewInit, OnDestroy {
       this.polygonPreview.destroy();
       const polygon = new Konva.Line({
         points: [...this.polygonPoints],
-        stroke: '#1e90ff',
-        fill: 'rgba(30,144,255,0.25)',
-        strokeWidth: 2,
-        closed: true
+        closed: true,
+        ...POLYGON_STYLE
       });
       this.contentGroup.add(polygon);
 
@@ -246,10 +220,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
     img.onload = () => {
       this.imageNode?.destroy();
 
-      const fitScale = Math.min(
-        this.stage.width() / img.width,
-        this.stage.height() / img.height
-      );
+      const fitScale = Math.min(this.stage.width() / img.width, this.stage.height() / img.height);
 
       this.contentGroup.destroyChildren();
       this.imageNode = new Konva.Image({
@@ -268,7 +239,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
       this.stage.position({ x: 0, y: 0 });
       this.stage.scale({ x: 1, y: 1 });
       this.layer.draw();
-      void this.restoreAnnotations(index);
+      void this.annotationService.restoreAnnotations(index, this.contentGroup, this.layer);
     };
   }
 
@@ -298,125 +269,13 @@ export class AppComponent implements AfterViewInit, OnDestroy {
     return withinImage ? pointer : null;
   }
 
-  private initDB(): Promise<IDBDatabase> {
-    return new Promise((resolve, reject) => {
-      const request = indexedDB.open(this.dbName, this.dbVersion);
-
-      request.onupgradeneeded = () => {
-        const db = request.result;
-        if (!db.objectStoreNames.contains(this.storeName)) {
-          db.createObjectStore(this.storeName, { keyPath: 'imageIndex' });
-        }
-      };
-
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error ?? new Error('Failed to open indexedDB'));
-    });
-  }
-
   private async saveAnnotationsForCurrentImage(): Promise<void> {
-    const db = await this.dbPromise;
-    if (!db) {
-      return;
-    }
-
-    const annotations = this.serializeAnnotations();
-    const payload: AnnotationRecord = {
-      imageIndex: this.currentIndex,
-      annotations
-    };
-
-    await this.putRecord(db, payload);
-  }
-
-  private serializeAnnotations(): StoredAnnotation[] {
-    const nodes = this.contentGroup.getChildren((node) => node !== this.imageNode);
-    const result: StoredAnnotation[] = [];
-
-    nodes.forEach((node) => {
-      if (node === this.polygonPreview || node === this.drawingRect) {
-        return;
-      }
-
-      if (node instanceof Konva.Rect) {
-        result.push({
-          type: 'rect',
-          x: node.x(),
-          y: node.y(),
-          width: node.width(),
-          height: node.height()
-        });
-      }
-
-      if (node instanceof Konva.Line && node.closed()) {
-        result.push({
-          type: 'polygon',
-          points: node.points()
-        });
-      }
-    });
-
-    return result;
-  }
-
-  private async restoreAnnotations(imageIndex: number): Promise<void> {
-    const db = await this.dbPromise;
-    if (!db) {
-      return;
-    }
-
-    const record = await this.getRecord(db, imageIndex);
-    if (!record?.annotations?.length) {
-      return;
-    }
-
-    record.annotations.forEach((item) => {
-      if (item.type === 'rect') {
-        const rect = new Konva.Rect({
-          x: item.x ?? 0,
-          y: item.y ?? 0,
-          width: item.width ?? 0,
-          height: item.height ?? 0,
-          stroke: '#ff4d4f',
-          strokeWidth: 2
-        });
-        this.contentGroup.add(rect);
-      }
-
-      if (item.type === 'polygon') {
-        const polygon = new Konva.Line({
-          points: item.points ?? [],
-          stroke: '#1e90ff',
-          fill: 'rgba(30,144,255,0.25)',
-          strokeWidth: 2,
-          closed: true
-        });
-        this.contentGroup.add(polygon);
-      }
-    });
-
-    this.layer.batchDraw();
-  }
-
-  private putRecord(db: IDBDatabase, payload: AnnotationRecord): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(this.storeName, 'readwrite');
-      const store = tx.objectStore(this.storeName);
-      store.put(payload);
-
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error ?? new Error('Failed to save annotations'));
-    });
-  }
-
-  private getRecord(db: IDBDatabase, imageIndex: number): Promise<AnnotationRecord | undefined> {
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(this.storeName, 'readonly');
-      const store = tx.objectStore(this.storeName);
-      const request = store.get(imageIndex);
-
-      request.onsuccess = () => resolve(request.result as AnnotationRecord | undefined);
-      request.onerror = () => reject(request.error ?? new Error('Failed to load annotations'));
-    });
+    await this.annotationService.saveAnnotations(
+      this.currentIndex,
+      this.contentGroup,
+      this.imageNode,
+      this.polygonPreview,
+      this.drawingRect
+    );
   }
 }
